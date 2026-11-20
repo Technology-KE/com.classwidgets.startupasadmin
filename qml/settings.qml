@@ -5,22 +5,35 @@ import RinUI
 import ClassWidgets.Plugins
 
 /*!
-    以管理员身份自启动 —— 设置页。
+    以管理员权限启动/重启 —— 设置页。
 
-    通过 Windows 计划任务，让 Class Widgets 2 在登录时以管理员身份自启动。
-    创建 / 删除任务需要管理员权限，后端会在后台线程里提权执行，
-    完成后发 statusChanged，这里据此刷新状态并显示结果。
+    两条互不相干的能力：
+      1. 计划任务：登录 Windows 时以最高权限（RunLevel Highest）启动主程序；
+      2. 以管理员权限重启：弹 UAC，把当前实例换成一个提权实例。
+    创建 / 删除任务需要管理员权限，后端在后台线程里提权执行，完成后发 statusChanged，
+    这里据此刷新状态并显示结果。
+
+    注意：主程序自己也有一个「开机自启动」（注册表 Run），两者同时开着会在登录时
+    把 Class Widgets 2 拉起两次，所以检测到它还开着时，这里只提供
+    「关闭当前开机自启并创建管理员权限启动」这一条路。
 */
 
 PluginPage {
     id: page
     pluginId: "com.classwidgets.startupasadmin"
-    title: qsTr("以管理员身份自启动")
+    title: qsTr("以管理员权限启动/重启")
 
     property var info: ({})
     property bool busy: false
     property string resultText: ""
     property bool resultOk: true
+    property string pendingAction: "create"   // create / disableAndCreate
+
+    readonly property bool appAutoStart: info.appAutoStart === true
+    readonly property bool taskExists: info.exists === true
+    readonly property bool elevated: info.elevated === true
+    // 主程序自己的开机自启开关在哪
+    readonly property string autoStartWhere: qsTr("设置 → 通用 → 开机自启动")
 
     Component.onCompleted: Qt.callLater(reload)
     onBackendChanged: { if (backend) Qt.callLater(reload) }
@@ -30,10 +43,8 @@ PluginPage {
         function onStatusChanged() {
             page.busy = false
             var r = backend ? backend.getLastResult() : null
-            if (r && r.message) {
-                page.resultOk = r.ok === true
-                page.resultText = String(r.message)
-            }
+            if (r && r.message)
+                page.showResult(r.ok === true, String(r.message))
             page.reload()
         }
     }
@@ -42,6 +53,35 @@ PluginPage {
         if (!backend) return
         var s = backend.getStatus()
         if (s) info = s
+    }
+
+    function showResult(ok, text) {
+        page.resultOk = ok
+        page.resultText = text
+        if (resultBar) {
+            resultBar.opacity = 1
+            resultBar.visible = text !== ""
+        }
+    }
+
+    function hideResult() {
+        page.resultText = ""
+        if (resultBar) resultBar.visible = false
+    }
+
+    // 0 = 出错，1 = 待处理，2 = 已就绪
+    function stateLevel() {
+        if (info.supported === false || info.appFound === false) return 0
+        if (info.exists !== true || info.upToDate !== true) return 1
+        return 2
+    }
+
+    function stateShort() {
+        if (info.supported === false) return qsTr("系统不支持")
+        if (info.appFound === false) return qsTr("未找到主程序")
+        if (info.exists !== true) return qsTr("尚未创建")
+        if (info.upToDate !== true) return qsTr("建议更新")
+        return qsTr("已就绪")
     }
 
     function stateText() {
@@ -53,128 +93,337 @@ PluginPage {
     }
 
     function stateColor() {
-        if (info.supported === false || info.appFound === false) return "#E05B5B"
-        if (info.exists !== true || info.upToDate !== true) return "#D28B59"
-        return "#46CEA3"
+        if (stateLevel() === 0) return Theme.currentTheme.colors.systemCriticalColor
+        if (stateLevel() === 1) return Theme.currentTheme.colors.systemCautionColor
+        return Theme.currentTheme.colors.systemSuccessColor
     }
 
-    ColumnLayout {
-        anchors.fill: parent
-        anchors.margins: 24
-        spacing: 16
+    // ── 动作 ────────────────────────────────────────────────
 
-        SettingCard {
-            Layout.fillWidth: true
-            title: qsTr("计划任务状态")
-            description: qsTr("计划任务会在你登录 Windows 时，以最高权限启动 Class Widgets 2。")
+    function runPending() {
+        if (!backend) return
+        page.busy = true
+        page.hideResult()
+        if (page.pendingAction === "disableAndCreate")
+            backend.requestDisableAutostartAndCreate()
+        else
+            backend.requestCreate()
+    }
 
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 6
+    // 主程序自己的开机自启还开着 → 先按主程序「重复打开」那样提示一次
+    function beginCreate() {
+        if (page.busy) return
+        page.pendingAction = "create"
+        if (page.appAutoStart)
+            duplicateDialog.open()
+        else
+            page.runPending()
+    }
 
-                RowLayout {
-                    spacing: 8
-                    Rectangle {
-                        width: 10
-                        height: 10
-                        radius: 5
-                        color: page.stateColor()
-                    }
-                    Text {
-                        text: page.stateText()
-                        font.bold: true
-                    }
-                }
+    function beginDisableAutostartAndCreate() {
+        if (page.busy) return
+        page.pendingAction = "disableAndCreate"
+        if (page.appAutoStart)
+            duplicateDialog.open()
+        else
+            page.runPending()
+    }
 
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    text: qsTr("任务名称：") + (page.info.taskName || "")
-                }
+    function removeTask() {
+        if (page.busy || !backend) return
+        page.busy = true
+        page.hideResult()
+        backend.requestDelete()
+    }
 
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    text: qsTr("主程序：") + (page.info.appPath || qsTr("未找到"))
-                }
+    function restartApp() {
+        if (page.busy || !backend) return
+        page.busy = true
+        page.hideResult()
+        backend.requestRestart()
+    }
 
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    visible: page.info.exists === true
-                    text: qsTr("已注册的路径：") + (page.info.registeredExe || "")
-                          + (page.info.runLevel ? qsTr("（运行级别 ") + page.info.runLevel + qsTr("）") : "")
-                }
+    // ── 重复打开提示（照主程序 CheckSingleInstanceDialog 的样子） ────
 
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    visible: page.info.appFound === false
-                    color: "#E05B5B"
-                    text: qsTr("没能自动找到主程序，请在下方「高级」里手动指定 Class Widgets 2 的 exe 路径。")
-                }
-            }
-        }
-
-        // 注册前的绿色提醒：主程序自带的开机自启动必须先关掉，
-        // 否则登录时会同时被主程序和计划任务拉起两次
-        SettingCard {
-            Layout.fillWidth: true
-            title: qsTr("注册前请先关闭主程序的开机自启动")
-            description: qsTr("两者同时开启会导致登录时重复启动。")
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 6
-
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    color: "#46CEA3"
-                    font.bold: true
-                    text: qsTr("请关闭主程序的开机自启动后再注册计划任务")
-                }
-            }
-        }
+    Dialog {
+        id: duplicateDialog
+        title: qsTr("重复启动提醒")
+        modal: true
 
         RowLayout {
+            Layout.fillWidth: true
             spacing: 12
 
-            Button {
-                text: page.busy ? qsTr("处理中…") : qsTr("创建 / 更新计划任务")
-                enabled: !page.busy
-                onClicked: {
-                    page.busy = true
-                    page.resultText = ""
-                    if (backend) backend.requestCreate()
-                }
+            Icon {
+                Layout.alignment: Qt.AlignTop
+                size: 42
+                name: "ic_fluent_warning_20_filled"
+                color: Theme.currentTheme.colors.systemCautionColor
             }
 
-            Button {
-                text: qsTr("删除计划任务")
-                enabled: !page.busy && page.info.exists === true
-                onClicked: {
-                    page.busy = true
-                    page.resultText = ""
-                    if (backend) backend.requestDelete()
-                }
-            }
-
-            Button {
-                text: qsTr("刷新状态")
-                enabled: !page.busy
-                onClicked: page.reload()
+            Text {
+                Layout.fillWidth: true
+                text: qsTr("若已开启开机自启，在创建计划任务后会在下次开机时重复开启 Class Widgets 2，是否删除已创建的计划任务？")
             }
         }
 
-        Text {
+        footer: DialogButtonBox {
             Layout.fillWidth: true
-            wrapMode: Text.Wrap
-            visible: page.resultText !== ""
-            color: page.resultOk ? "#46CEA3" : "#E05B5B"
+
+            Button {
+                Layout.fillWidth: true
+                text: qsTr("取消")
+                onClicked: duplicateDialog.close()
+            }
+
+            Button {
+                Layout.fillWidth: true
+                text: qsTr("继续创建")
+                highlighted: true
+                onClicked: {
+                    duplicateDialog.close()
+                    page.runPending()
+                }
+            }
+        }
+    }
+
+    // ── 页面内容 ────────────────────────────────────────────
+
+    ColumnLayout {
+        Layout.fillWidth: true
+        spacing: 4
+
+        // 计划任务状态
+        Frame {
+            Layout.fillWidth: true
+            leftPadding: 18
+            rightPadding: 18
+            topPadding: 16
+            bottomPadding: 16
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 12
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 12
+
+                    Icon {
+                        Layout.alignment: Qt.AlignTop
+                        size: 22
+                        name: "ic_fluent_shield_checkmark_20_regular"
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 2
+
+                        Text {
+                            Layout.fillWidth: true
+                            typography: Typography.Body
+                            text: qsTr("计划任务状态")
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            typography: Typography.Caption
+                            color: Theme.currentTheme.colors.textSecondaryColor
+                            text: qsTr("计划任务会在你登录 Windows 时，以最高权限启动 Class Widgets 2。")
+                        }
+                    }
+
+                    PillButton {
+                        text: page.stateShort()
+                        checkable: false
+                        highlighted: page.stateLevel() === 2
+                    }
+
+                    ToolButton {
+                        icon.name: "ic_fluent_arrow_sync_20_regular"
+                        enabled: !page.busy
+                        onClicked: page.reload()
+
+                        ToolTip {
+                            text: qsTr("刷新状态")
+                            parent: parent
+                            visible: parent.hovered
+                        }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: Math.max(1, Theme.currentTheme.appearance.borderWidth)
+                    color: Theme.currentTheme.colors.cardBorderColor
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Text {
+                        Layout.fillWidth: true
+                        typography: Typography.BodyStrong
+                        color: page.stateColor()
+                        text: page.stateText()
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        typography: Typography.Caption
+                        color: Theme.currentTheme.colors.textSecondaryColor
+                        text: qsTr("任务名称：") + (page.info.taskName || "")
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        typography: Typography.Caption
+                        color: Theme.currentTheme.colors.textSecondaryColor
+                        text: qsTr("主程序：") + (page.info.appPath || qsTr("未找到"))
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        typography: Typography.Caption
+                        color: Theme.currentTheme.colors.textSecondaryColor
+                        visible: page.taskExists
+                        text: qsTr("已注册：") + (page.info.registeredExe || "")
+                              + (page.info.runLevel ? qsTr("（运行级别 ") + page.info.runLevel + qsTr("）") : "")
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        typography: Typography.Caption
+                        color: Theme.currentTheme.colors.textSecondaryColor
+                        text: qsTr("当前运行权限：") + (page.elevated ? qsTr("管理员") : qsTr("标准用户"))
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        typography: Typography.Caption
+                        visible: page.info.appFound === false
+                        color: Theme.currentTheme.colors.systemCriticalColor
+                        text: qsTr("没能自动找到主程序，请在下方「高级」里手动指定 Class Widgets 2 的 exe 路径。")
+                    }
+                }
+            }
+        }
+
+        // 主程序自己的开机自启还开着时才会出现
+        Frame {
+            Layout.fillWidth: true
+            visible: page.appAutoStart
+            leftPadding: 18
+            rightPadding: 18
+            topPadding: 16
+            bottomPadding: 16
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 12
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 12
+
+                    Icon {
+                        Layout.alignment: Qt.AlignTop
+                        size: 22
+                        name: "ic_fluent_warning_20_filled"
+                        color: Theme.currentTheme.colors.systemCautionColor
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 2
+
+                        Text {
+                            Layout.fillWidth: true
+                            typography: Typography.Body
+                            text: qsTr("主程序自己也开着开机自启")
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            typography: Typography.Caption
+                            color: Theme.currentTheme.colors.textSecondaryColor
+                            text: qsTr("这两边都会在登录时启动 Class Widgets 2，同时开着就会启动两次。"
+                                      + "可以在「" + page.autoStartWhere + "」里手动关掉，"
+                                      + "也可以直接点下面的按钮，一次关掉并创建管理员权限启动。")
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+
+                    Button {
+                        text: qsTr("关闭当前开机自启并创建管理员权限启动")
+                        highlighted: true
+                        enabled: !page.busy && page.info.appFound !== false
+                        onClicked: page.beginDisableAutostartAndCreate()
+                    }
+                }
+            }
+        }
+
+        // 动作
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+
+            Button {
+                // 主程序自启还开着时，创建动作在上面的提示里
+                visible: !page.appAutoStart
+                text: page.taskExists ? qsTr("更新计划任务") : qsTr("创建计划任务")
+                highlighted: !page.taskExists
+                enabled: !page.busy && page.info.appFound !== false
+                onClicked: page.beginCreate()
+            }
+
+            Button {
+                text: qsTr("以管理员权限重启")
+                highlighted: page.taskExists
+                enabled: !page.busy && page.info.appFound !== false
+                onClicked: page.restartApp()
+            }
+
+            Button {
+                visible: page.taskExists
+                text: qsTr("删除计划任务")
+                enabled: !page.busy
+                onClicked: page.removeTask()
+            }
+
+            BusyIndicator {
+                Layout.alignment: Qt.AlignVCenter
+                size: 16
+                running: page.busy
+                visible: page.busy
+            }
+
+            Text {
+                Layout.fillWidth: true
+                verticalAlignment: Text.AlignVCenter
+                visible: page.busy
+                typography: Typography.Caption
+                color: Theme.currentTheme.colors.textSecondaryColor
+                text: qsTr("正在等待管理员授权…")
+            }
+        }
+
+        InfoBar {
+            id: resultBar
+            Layout.fillWidth: true
+            visible: false
+            severity: page.resultOk ? Severity.Success : Severity.Error
             text: page.resultText
         }
 
+        // 高级
         SettingExpander {
             Layout.fillWidth: true
             icon.name: "ic_fluent_settings_20_regular"
@@ -223,10 +472,11 @@ PluginPage {
 
         Text {
             Layout.fillWidth: true
-            wrapMode: Text.Wrap
-            text: qsTr("提示：创建或删除计划任务需要管理员权限，点击按钮后会出现 UAC 授权窗口。" +
-                       "创建好的任务不会随插件卸载而删除，需要时请回到这里手动删除；" +
-                       "若之后移动了 Class Widgets 2 的位置，请回来点一次「创建 / 更新」。")
+            typography: Typography.Caption
+            color: Theme.currentTheme.colors.textSecondaryColor
+            text: qsTr("提示：创建 / 删除计划任务、以管理员权限重启都会弹 UAC 授权窗口；"
+                      + "创建好的任务不会随插件卸载而删除，需要时请回到这里手动删除；"
+                      + "若之后移动了 Class Widgets 2 的位置，请回来点一次「更新计划任务」。")
         }
     }
 }

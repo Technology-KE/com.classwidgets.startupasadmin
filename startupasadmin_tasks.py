@@ -155,8 +155,8 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
 
 
 def _shell_execute_ex(verb: str, file: str, params: str,
-                      timeout_ms: int) -> Tuple[bool, int]:
-    """ShellExecuteExW + 等待结束，返回 (是否已启动, 退出码或错误码)。"""
+                      timeout_ms: int, wait: bool = True) -> Tuple[bool, int]:
+    """ShellExecuteExW（wait=True 时等它结束），返回 (是否已启动, 退出码或错误码)。"""
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -183,6 +183,9 @@ def _shell_execute_ex(verb: str, file: str, params: str,
 
     handle = sei.hProcess
     if not handle:
+        return True, 0
+    if not wait:          # 只负责拉起来，不等它结束（重启用：它还要等我们退出）
+        kernel32.CloseHandle(handle)
         return True, 0
     try:
         kernel32.WaitForSingleObject(handle, timeout_ms)
@@ -245,6 +248,73 @@ def _run_elevated_script(body: str, timeout_ms: int = 300_000) -> Tuple[bool, st
     if code != 0:
         return False, message or f"提权进程退出码 {code}"
     return True, "OK"
+
+
+def _launch_elevated_script(body: str) -> Tuple[bool, str]:
+    """把 PowerShell 脚本写到临时文件并提权启动，**不等它结束**。
+
+    用于「以管理员权限重启」：提权脚本要先等我们退出，等它结束就死锁了。
+    """
+    if not _IS_WINDOWS:
+        return False, "仅支持 Windows"
+
+    ps1_file = Path(tempfile.gettempdir()) / f"cw2_startupasadmin_relaunch_{os.getpid()}.ps1"
+    script = "$ErrorActionPreference = 'Stop'\n" + body
+    try:
+        ps1_file.write_text(script, encoding="utf-8-sig")
+    except OSError as e:
+        return False, f"写入临时脚本失败: {e}"
+
+    params = f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{ps1_file}"'
+    launched, code = _shell_execute_ex("runas", "powershell.exe", params, 0, wait=False)
+    if not launched:
+        if code == _ERROR_CANCELLED:
+            return False, "已取消管理员授权（UAC）"
+        return False, f"提权执行失败（错误码 {code}）"
+    return True, ""
+
+
+# 提权脚本：等当前进程退出（免得撞上主程序的单实例锁），再用最高权限拉起主程序
+_RELAUNCH_BODY = """
+$target = __EXE__
+$workdir = __WD__
+$owner = __PID__
+$arguments = @(__ARGS__)
+
+$proc = Get-Process -Id $owner -ErrorAction SilentlyContinue
+if ($null -ne $proc) {
+    try { $proc.WaitForExit(60000) } catch { }
+}
+Start-Sleep -Milliseconds 600
+if ($arguments.Count -gt 0) {
+    Start-Process -FilePath $target -WorkingDirectory $workdir -ArgumentList $arguments
+} else {
+    Start-Process -FilePath $target -WorkingDirectory $workdir
+}
+"""
+
+
+def restart_as_admin(exe_path, arguments=()) -> Tuple[bool, str]:
+    """以管理员权限重启主程序。会弹 UAC；成功后调用方应让当前进程退出。"""
+    if not _IS_WINDOWS:
+        return False, "仅支持 Windows"
+
+    exe = Path(str(exe_path))
+    if not exe.is_file():
+        return False, f"主程序文件不存在：{exe}"
+
+    args_ps = ", ".join(_ps_quote(a) for a in arguments)
+    body = (_RELAUNCH_BODY
+            .replace("__EXE__", _ps_quote(str(exe)))
+            .replace("__WD__", _ps_quote(str(exe.parent)))
+            .replace("__PID__", str(os.getpid()))
+            .replace("__ARGS__", args_ps))
+    ok, message = _launch_elevated_script(body)
+    if not ok:
+        logger.warning(f"[startupasadmin] 以管理员权限重启失败: {message}")
+        return False, message
+    logger.info("[startupasadmin] 已请求在管理员权限下重新启动主程序")
+    return True, "正在关闭当前实例，并以管理员权限重新启动 Class Widgets 2…"
 
 
 # ── 计划任务操作 ────────────────────────────────────────────────────
@@ -339,3 +409,85 @@ def delete_task(task_name: str) -> Tuple[bool, str]:
         return True, "计划任务已删除"
     logger.warning(f"[startupasadmin] 删除计划任务失败: {message}")
     return False, message
+
+
+# ── 主程序自带的开机自启（注册表 Run） ─────────────────────────────
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+# 主程序自己写进 Run 的值名见 src/__init__.py 的 __app_name__
+APP_REG_NAME = "ClassWidgets_2"
+
+
+def _looks_like_app_autostart(name: str, value: str) -> bool:
+    """这条 Run 记录是不是主程序自己加的开机自启。"""
+    n = (name or "").strip().lower()
+    n_flat = n.replace("_", "").replace(" ", "")
+    v = (value or "").strip().lower()
+    if n_flat == APP_REG_NAME.lower().replace("_", "") or n_flat.startswith("classwidgets"):
+        return True
+    if "classwidgets" in v or "class widgets" in v:
+        return True
+    return any(exe.lower() in v for exe in _APP_EXE_NAMES)
+
+
+def main_autostart_info() -> dict:
+    """主程序自己的「开机自启动」有没有开着。
+
+    返回 dict：enabled / name / value / scope（HKCU 或 HKLM）。
+    只读注册表，不需要管理员权限。
+    """
+    info = {"enabled": False, "name": "", "value": "", "scope": ""}
+    if not _IS_WINDOWS:
+        return info
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - 非 Windows
+        return info
+
+    for root, scope in ((winreg.HKEY_CURRENT_USER, "HKCU"),
+                        (winreg.HKEY_LOCAL_MACHINE, "HKLM")):
+        try:
+            key = winreg.OpenKey(root, _RUN_KEY, 0, winreg.KEY_READ)
+        except OSError:
+            continue
+        try:
+            index = 0
+            while True:
+                try:
+                    name, value, _type = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                index += 1
+                if _looks_like_app_autostart(str(name), str(value)):
+                    return {"enabled": True, "name": str(name),
+                            "value": str(value), "scope": scope}
+        finally:
+            key.Close()
+    return info
+
+
+def disable_main_autostart() -> Tuple[bool, str]:
+    """关掉主程序自己的开机自启（删注册表 Run 值，不需要管理员权限）。"""
+    info = main_autostart_info()
+    if not info.get("enabled"):
+        return True, "主程序的开机自启本来就已关闭"
+
+    name = str(info.get("name") or "")
+    if info.get("scope") != "HKCU":
+        return False, "主程序的开机自启注册在系统级（HKLM\\...\\Run），需要管理员权限才能关闭"
+
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, name)
+    except FileNotFoundError:
+        return True, "主程序的开机自启已经不在了"
+    except Exception as e:
+        logger.warning(f"[startupasadmin] 关闭主程序的开机自启失败: {e}")
+        return False, f"关闭主程序的开机自启失败: {e}"
+
+    logger.info(f"[startupasadmin] 已关闭主程序的开机自启: {name}")
+    return True, "已关闭主程序的开机自启"

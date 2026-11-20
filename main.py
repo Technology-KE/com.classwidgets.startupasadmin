@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""以管理员身份自启动 —— Class Widgets 2 插件。
+"""以管理员权限启动/重启 —— Class Widgets 2 插件。
 
-通过 Windows 计划任务，让 Class Widgets 2 在用户登录时以管理员身份自启动。
+通过 Windows 计划任务，让 Class Widgets 2 在用户登录时以管理员权限自启动；
+另外提供「以管理员权限重启」，把当前正在运行的实例换成一个提权的实例。
 思路来自 ClassIsland 的 StartUpAsAdmin 插件。
 
 本插件不注册桌面组件，只注册一个设置页（``api.ui.register_settings_page``）。
@@ -10,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -28,13 +30,16 @@ except ImportError:  # pragma: no cover - SDK 一般已把插件目录加入 sys
     import startupasadmin_tasks as tasks
 
 _SETTINGS_ICON = "ic_fluent_shield_20_regular"
+_SETTINGS_TITLE = "以管理员权限启动/重启"
 
 
 class Plugin(CW2Plugin):
-    """以管理员身份自启动。"""
+    """以管理员权限启动/重启。"""
 
     # 计划任务状态变化（设置页据此刷新）
     statusChanged = Signal()
+    # 请求主线程退出当前实例（提权实例会等我们退出后才启动）
+    quitRequested = Signal()
 
     def __init__(self, api: PluginAPI):
         super().__init__(api)
@@ -42,6 +47,7 @@ class Plugin(CW2Plugin):
         self._page = str(Path(__file__).parent / "qml" / "settings.qml")
         self._busy = False
         self._last_result = {"ok": True, "message": ""}
+        self.quitRequested.connect(self._quit_app)
 
     # ── 生命周期 ────────────────────────────────────────────────
 
@@ -56,7 +62,7 @@ class Plugin(CW2Plugin):
         try:
             self.api.ui.register_settings_page(
                 qml_path=self._page,
-                title="以管理员身份自启动",
+                title=_SETTINGS_TITLE,
                 icon=_SETTINGS_ICON,
             )
             logger.info("[startupasadmin] 设置页注册成功")
@@ -106,6 +112,7 @@ class Plugin(CW2Plugin):
                 up_to_date = Path(registered).resolve() == Path(exe).resolve()
             except OSError:
                 up_to_date = registered.lower() == str(exe).lower()
+        auto = tasks.main_autostart_info()
         return {
             "supported": os.name == "nt",
             "elevated": tasks.is_admin(),
@@ -119,6 +126,11 @@ class Plugin(CW2Plugin):
             "upToDate": up_to_date,
             "customExe": self._config.custom_exe or "",
             "error": str(info.get("error") or ""),
+            # 主程序自己（设置 → 通用 → 开机自启动）有没有开着自启，与本插件的计划任务无关
+            "appAutoStart": bool(auto.get("enabled")),
+            "appAutoStartName": str(auto.get("name") or ""),
+            "appAutoStartValue": str(auto.get("value") or ""),
+            "appAutoStartScope": str(auto.get("scope") or ""),
         }
 
     @Slot()
@@ -130,6 +142,32 @@ class Plugin(CW2Plugin):
     def requestDelete(self) -> None:
         """删除计划任务。同样放到后台线程。"""
         self._run_async(self._delete_impl)
+
+    @Slot()
+    def requestDisableAutostartAndCreate(self) -> None:
+        """先关掉主程序自己的开机自启，再创建计划任务。"""
+        self._run_async(self._disable_autostart_and_create_impl)
+
+    @Slot()
+    def requestRestart(self) -> None:
+        """以管理员权限重启主程序；已经提权时就是普通重启。"""
+        if os.name != "nt":
+            self._last_result = {"ok": False, "message": "本插件仅支持 Windows"}
+            self.statusChanged.emit()
+            return
+        if self._busy:
+            return
+        if tasks.is_admin():
+            # 已经是管理员了，不需要再提权，直接走主程序的普通重启
+            try:
+                self.api.application.restart()
+            except Exception as e:
+                logger.warning("[startupasadmin] 重启失败: {}", e)
+                self._last_result = {"ok": False, "message": f"重启失败：{e}"}
+                self.statusChanged.emit()
+            return
+        self._busy = True
+        threading.Thread(target=self._restart_worker, daemon=True).start()
 
     def _run_async(self, fn):
         if self._busy:
@@ -159,6 +197,66 @@ class Plugin(CW2Plugin):
         if os.name != "nt":
             return False, "本插件仅支持 Windows"
         return tasks.delete_task(self._task_name())
+
+    def _disable_autostart_and_create_impl(self):
+        """先创建计划任务，成功后再关掉主程序的开机自启。
+
+        顺序很重要：先关自启、再建任务的话，用户在中途取消 UAC 就会落到
+        「自启关了、任务也没有」的状态；反过来最多只是自启没关掉（提示还在）。
+        """
+        if os.name != "nt":
+            return False, "本插件仅支持 Windows"
+
+        ok, message = self._create_impl()
+        if not ok:
+            return False, message
+
+        closed, close_message = tasks.disable_main_autostart()
+        if not closed:
+            return False, f"{message}；但{close_message}"
+        self._sync_autostart_config()
+        return True, f"{message}；{close_message}"
+
+    def _sync_autostart_config(self):
+        """把主程序「开机自启动」的开关同步成关闭，免得它下次启动又写回注册表。"""
+        try:
+            configs = getattr(getattr(self.api, "globalconfig", None), "configs", None)
+            if configs is not None:
+                configs.set("app.auto_startup", False)
+        except Exception as e:
+            logger.warning("[startupasadmin] 同步 app.auto_startup 失败: {}", e)
+
+    def _restart_worker(self):
+        try:
+            exe = self._exe()
+            if exe is None:
+                ok, message = False, "找不到主程序，无法重启"
+            else:
+                ok, message = tasks.restart_as_admin(exe, self._extra_args())
+        except Exception as e:
+            ok, message = False, f"执行失败：{e}"
+            logger.exception("[startupasadmin] 以管理员权限重启异常")
+        self._last_result = {"ok": bool(ok), "message": str(message)}
+        self._busy = False
+        self.statusChanged.emit()
+        if ok:
+            self.quitRequested.emit()   # 排队到主线程，等本轮刷新完再退出
+
+    @staticmethod
+    def _extra_args():
+        """打包运行时把启动参数原样带给提权后的新实例。"""
+        if getattr(sys, "frozen", False):
+            return [a for a in sys.argv[1:] if a]
+        return []
+
+    @Slot()
+    def _quit_app(self):
+        from PySide6.QtWidgets import QApplication
+
+        logger.info("[startupasadmin] 退出当前实例，交给管理员权限的实例接管")
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     @Slot(result=dict)
     def getLastResult(self) -> dict:
